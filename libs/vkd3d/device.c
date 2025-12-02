@@ -857,7 +857,7 @@ static const struct vkd3d_shader_quirk_info death_stranding_quirks = {
 
 static const struct vkd3d_shader_quirk_hash wuthering_waves_hashes[] = {
     /* LightGridInjectionCS. Forgets to UAV barrier after ClearCS. */
-    { 0x63bad782eb2380fb, VKD3D_SHADER_QUIRK_FORCE_PRE_COMPUTE_BARRIER },
+    { 0x513ffbb9ffc55d06, VKD3D_SHADER_QUIRK_FORCE_PRE_COMPUTE_BARRIER },
 };
 
 static const struct vkd3d_shader_quirk_info wuthering_waves_quirks = {
@@ -2129,6 +2129,15 @@ static void vkd3d_physical_device_info_init(struct vkd3d_physical_device_info *i
         info->dynamic_rendering_unused_attachments_features.sType =
                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_FEATURES_EXT;
         vk_prepend_struct(&info->features2, &info->dynamic_rendering_unused_attachments_features);
+    }
+    else
+    {
+        /* This extension was intended to be part of dynamic rendering in the first place, but was carved out
+         * due to some requirements for IHVs vkd3d-proton does not cater to.
+         * If this is not supported, simply assume that the driver is just a bit old.
+         * No need to fail device creation here.
+         * Every driver we are known to run on supports this just fine. */
+        WARN("VK_EXT_dynamic_rendering_unused_attachments not supported. The functionality in this EXT is required for correct operation.\n");
     }
 
     if (vulkan_info->EXT_line_rasterization)
@@ -4026,6 +4035,8 @@ static HRESULT d3d12_device_create_query_pool(struct d3d12_device *device, uint3
     pool->type_index = type_index;
     pool->query_count = pool_info.queryCount;
     pool->next_index = 0;
+
+    VK_CALL(vkResetQueryPool(device->vk_device, pool->vk_query_pool, 0, pool->query_count));
     return S_OK;
 }
 
@@ -4040,6 +4051,7 @@ static void d3d12_device_destroy_query_pool(struct d3d12_device *device, const s
 
 HRESULT d3d12_device_get_query_pool(struct d3d12_device *device, uint32_t type_index, struct vkd3d_query_pool *pool)
 {
+    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
     size_t i;
 
     pthread_mutex_lock(&device->mutex);
@@ -4053,6 +4065,8 @@ HRESULT d3d12_device_get_query_pool(struct d3d12_device *device, uint32_t type_i
             if (--device->query_pool_count != i)
                 device->query_pools[i] = device->query_pools[device->query_pool_count];
             pthread_mutex_unlock(&device->mutex);
+
+            VK_CALL(vkResetQueryPool(device->vk_device, pool->vk_query_pool, 0, pool->query_count));
             return S_OK;
         }
     }
@@ -8886,8 +8900,30 @@ static void d3d12_device_caps_init_feature_options3(struct d3d12_device *device)
     options3->WriteBufferImmediateSupportFlags = D3D12_COMMAND_LIST_SUPPORT_FLAG_DIRECT |
             D3D12_COMMAND_LIST_SUPPORT_FLAG_COMPUTE | D3D12_COMMAND_LIST_SUPPORT_FLAG_COPY |
             D3D12_COMMAND_LIST_SUPPORT_FLAG_BUNDLE;
-    /* Currently not supported */
-    options3->ViewInstancingTier = D3D12_VIEW_INSTANCING_TIER_NOT_SUPPORTED;
+
+    if (vkd3d_debug_control_is_test_suite() ||
+            (vkd3d_config_flags & VKD3D_CONFIG_FLAG_ENABLE_EXPERIMENTAL_FEATURES))
+    {
+        /* Currently only partially implemented.
+         * TIER_2 is most appropriate since it allows for fast path in certain situations and
+         * fallback in some other cases. */
+        options3->ViewInstancingTier =
+                device->device_info.vulkan_1_1_features.multiview &&
+                device->device_info.vulkan_1_2_features.shaderOutputLayer &&
+                device->device_info.vulkan_1_2_features.shaderOutputViewportIndex &&
+                device->device_info.vulkan_1_1_features.multiviewGeometryShader &&
+                device->device_info.vulkan_1_1_features.multiviewTessellationShader &&
+                (!device->device_info.mesh_shader_features.meshShader ||
+                        device->device_info.mesh_shader_features.multiviewMeshShader) ?
+                D3D12_VIEW_INSTANCING_TIER_2 :
+                D3D12_VIEW_INSTANCING_TIER_NOT_SUPPORTED;
+    }
+    else
+    {
+        /* Currently not supported */
+        options3->ViewInstancingTier = D3D12_VIEW_INSTANCING_TIER_NOT_SUPPORTED;
+    }
+
     options3->BarycentricsSupported =
             device->device_info.barycentric_features_nv.fragmentShaderBarycentric ||
             device->device_info.barycentric_features_khr.fragmentShaderBarycentric;
